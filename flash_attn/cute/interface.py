@@ -60,25 +60,9 @@ torch2cute_dtype_map = {
 
 
 def create_semaphore_tensor(batch_size, num_heads, num_m_blocks, num_stages=2, device='cuda'):
-    """
-    Create a semaphore tensor for deterministic backward pass.
-
-    Args:
-        batch_size: Batch size
-        num_heads: Number of attention heads (query heads, not KV heads)
-        num_m_blocks: Number of M (sequence) blocks
-        num_stages: Number of pipeline stages (default: 2)
-        device: Device to allocate tensor on
-
-    Returns:
-        torch.Tensor: Semaphore tensor with shape (batch, num_heads, num_m_blocks, num_stages)
-                      initialized to zeros (uint64 type for atomic operations)
-    """
-    # Semaphore tensor needs to be uint64 for atomic operations
-    # Shape: (batch, num_heads, num_m_blocks, num_stages)
     semaphore = torch.zeros(
         (batch_size, num_heads, num_m_blocks, num_stages),
-        dtype=torch.int64,  # Use int64 which corresponds to uint64 in CUDA
+        dtype=torch.int64,
         device=device
     )
     return semaphore
@@ -788,7 +772,6 @@ def _flash_attn_bwd(
     if qhead_per_kvhead > 1:
         print(f"  mdK_semaphore shape: ({batch_size}, {num_head_kv}, {num_n_blocks}, 2)")
         print(f"  mdV_semaphore shape: ({batch_size}, {num_head_kv}, {num_n_blocks}, 2)")
-        print(f"  Note: K/V semaphores required for GQA with deterministic mode")
 
         # mdK_semaphore: (batch, num_heads_kv, num_n_blocks, num_stages)
         mdK_semaphore = create_semaphore_tensor(
@@ -799,8 +782,6 @@ def _flash_attn_bwd(
             batch_size, num_head_kv, num_n_blocks, num_stages=2, device=device
         )
     else:
-        print(f"  mdK_semaphore: None (not needed for MHA)")
-        print(f"  mdV_semaphore: None (not needed for MHA)")
         mdK_semaphore = None
         mdV_semaphore = None
 
@@ -812,7 +793,6 @@ def _flash_attn_bwd(
     )
 
     if mdK_semaphore is not None and mdV_semaphore is not None:
-        print(f"  Converting mdK_semaphore and mdV_semaphore...")
         mdK_semaphore_cute = from_dlpack(mdK_semaphore.detach(), assumed_align=8).mark_layout_dynamic(
             leading_dim=mdK_semaphore.ndim - 1
         )
@@ -820,7 +800,6 @@ def _flash_attn_bwd(
             leading_dim=mdV_semaphore.ndim - 1
         )
     else:
-        print(f"  Skipping mdK/mdV semaphore conversion (not needed for MHA)")
         mdK_semaphore_cute = None
         mdV_semaphore_cute = None
 
