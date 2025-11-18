@@ -760,8 +760,8 @@ def _flash_attn_bwd(
     num_m_blocks = (seqlen_q + tile_m - 1) // tile_m
     num_n_blocks = (seqlen_k + tile_n - 1) // tile_n
 
-    print(f"Creating semaphore tensors:")
-    print(f"  mdQ_semaphore shape: ({batch_size}, {num_head}, {num_m_blocks}, 2)")
+    # print(f"Creating semaphore tensors:")
+    # print(f"  mdQ_semaphore shape: ({batch_size}, {num_head}, {num_m_blocks}, 2)")
     mdQ_semaphore = create_semaphore_tensor(
         batch_size, num_head, num_m_blocks, num_stages=2, device=device
     )
@@ -770,8 +770,8 @@ def _flash_attn_bwd(
     # These are used for synchronization when accumulating gradients across query heads
     qhead_per_kvhead = num_head // num_head_kv
     if qhead_per_kvhead > 1:
-        print(f"  mdK_semaphore shape: ({batch_size}, {num_head_kv}, {num_n_blocks}, 2)")
-        print(f"  mdV_semaphore shape: ({batch_size}, {num_head_kv}, {num_n_blocks}, 2)")
+        # print(f"  mdK_semaphore shape: ({batch_size}, {num_head_kv}, {num_n_blocks}, 2)")
+        # print(f"  mdV_semaphore shape: ({batch_size}, {num_head_kv}, {num_n_blocks}, 2)")
 
         # mdK_semaphore: (batch, num_heads_kv, num_n_blocks, num_stages)
         mdK_semaphore = create_semaphore_tensor(
@@ -787,7 +787,7 @@ def _flash_attn_bwd(
 
 
 
-    print(f"\nConverting semaphore tensors to cute format...")
+    # print(f"\nConverting semaphore tensors to cute format...")
     mdQ_semaphore_cute = from_dlpack(mdQ_semaphore.detach(), assumed_align=8).mark_layout_dynamic(
         leading_dim=mdQ_semaphore.ndim - 1
     )
