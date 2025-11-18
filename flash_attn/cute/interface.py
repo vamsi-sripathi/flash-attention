@@ -59,6 +59,30 @@ torch2cute_dtype_map = {
 }
 
 
+def create_semaphore_tensor(batch_size, num_heads, num_m_blocks, num_stages=2, device='cuda'):
+    """
+    Create a semaphore tensor for deterministic backward pass.
+
+    Args:
+        batch_size: Batch size
+        num_heads: Number of attention heads (query heads, not KV heads)
+        num_m_blocks: Number of M (sequence) blocks
+        num_stages: Number of pipeline stages (default: 2)
+        device: Device to allocate tensor on
+
+    Returns:
+        torch.Tensor: Semaphore tensor with shape (batch, num_heads, num_m_blocks, num_stages)
+                      initialized to zeros (uint64 type for atomic operations)
+    """
+    # Semaphore tensor needs to be uint64 for atomic operations
+    # Shape: (batch, num_heads, num_m_blocks, num_stages)
+    semaphore = torch.zeros(
+        (batch_size, num_heads, num_m_blocks, num_stages),
+        dtype=torch.int64,  # Use int64 which corresponds to uint64 in CUDA
+        device=device
+    )
+    return semaphore
+
 def num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, max_splits):
     # If num_n_blocks is too small, use 1 split. For example, we never split for hdim = 128 and seqlen_k = 512.
     if num_n_blocks <= 4:
@@ -745,6 +769,62 @@ def _flash_attn_bwd(
     ]
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
+
+
+    tile_m = 128  # Default M tile size for SM100
+    tile_n = 128  # Default N tile size for SM100
+    num_m_blocks = (seqlen_q + tile_m - 1) // tile_m
+    num_n_blocks = (seqlen_k + tile_n - 1) // tile_n
+
+    print(f"Creating semaphore tensors:")
+    print(f"  mdQ_semaphore shape: ({batch_size}, {num_head}, {num_m_blocks}, 2)")
+    mdQ_semaphore = create_semaphore_tensor(
+        batch_size, num_head, num_m_blocks, num_stages=2, device=device
+    )
+
+    # For GQA with deterministic mode, we MUST provide mdK and mdV semaphores
+    # These are used for synchronization when accumulating gradients across query heads
+    qhead_per_kvhead = num_head // num_head_kv
+    if qhead_per_kvhead > 1:
+        print(f"  mdK_semaphore shape: ({batch_size}, {num_head_kv}, {num_n_blocks}, 2)")
+        print(f"  mdV_semaphore shape: ({batch_size}, {num_head_kv}, {num_n_blocks}, 2)")
+        print(f"  Note: K/V semaphores required for GQA with deterministic mode")
+
+        # mdK_semaphore: (batch, num_heads_kv, num_n_blocks, num_stages)
+        mdK_semaphore = create_semaphore_tensor(
+            batch_size, num_head_kv, num_n_blocks, num_stages=2, device=device
+        )
+        # mdV_semaphore: (batch, num_heads_kv, num_n_blocks, num_stages)
+        mdV_semaphore = create_semaphore_tensor(
+            batch_size, num_head_kv, num_n_blocks, num_stages=2, device=device
+        )
+    else:
+        print(f"  mdK_semaphore: None (not needed for MHA)")
+        print(f"  mdV_semaphore: None (not needed for MHA)")
+        mdK_semaphore = None
+        mdV_semaphore = None
+
+
+
+    print(f"\nConverting semaphore tensors to cute format...")
+    mdQ_semaphore_cute = from_dlpack(mdQ_semaphore.detach(), assumed_align=8).mark_layout_dynamic(
+        leading_dim=mdQ_semaphore.ndim - 1
+    )
+
+    if mdK_semaphore is not None and mdV_semaphore is not None:
+        print(f"  Converting mdK_semaphore and mdV_semaphore...")
+        mdK_semaphore_cute = from_dlpack(mdK_semaphore.detach(), assumed_align=8).mark_layout_dynamic(
+            leading_dim=mdK_semaphore.ndim - 1
+        )
+        mdV_semaphore_cute = from_dlpack(mdV_semaphore.detach(), assumed_align=8).mark_layout_dynamic(
+            leading_dim=mdV_semaphore.ndim - 1
+        )
+    else:
+        print(f"  Skipping mdK/mdV semaphore conversion (not needed for MHA)")
+        mdK_semaphore_cute = None
+        mdV_semaphore_cute = None
+
+
     # Preprocess kernel: compute (o * dout).sum(dim=-1), lse * log2_e, and zero out dq_accum.
     compile_key_pre = (compute_capability, dtype, head_dim_v, m_block_size, num_threads)
     if compile_key_pre not in _flash_attn_bwd.compile_cache_pre:
@@ -862,16 +942,32 @@ def _flash_attn_bwd(
                 V_in_regs=V_in_regs,
             )
         else:
+#            fa_bwd_obj = FlashAttentionBackwardSm100(
+#                head_dim,
+#                head_dim_v,
+#                is_causal=causal,
+#                qhead_per_kvhead=qhead_per_kvhead,
+                # tile_m=m_block_size,
+                # tile_n=n_block_size,
+#                cluster_size=cluster_size,
+                # cluster_size=1,
+#            )
             fa_bwd_obj = FlashAttentionBackwardSm100(
-                head_dim,
-                head_dim_v,
+                head_dim=head_dim,
+                head_dim_v=head_dim_v,
                 is_causal=causal,
+                is_local=False,
                 qhead_per_kvhead=qhead_per_kvhead,
+                tile_m=tile_m,
+                tile_n=tile_n,
+                is_persistent=False,
+                deterministic=True,
                 # tile_m=m_block_size,
                 # tile_n=n_block_size,
                 cluster_size=cluster_size,
                 # cluster_size=1,
             )
+
         # TODO: check @can_implement
         _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
             fa_bwd_obj,
@@ -890,6 +986,9 @@ def _flash_attn_bwd(
             cu_seqlens_k_tensor,
             seqused_q_tensor,
             seqused_k_tensor,
+            mdQ_semaphore=mdQ_semaphore_cute,
+            mdK_semaphore=mdK_semaphore_cute,
+            mdV_semaphore=mdV_semaphore_cute,
         )
     _flash_attn_bwd.compile_cache[compile_key](
         q_tensor,
@@ -907,6 +1006,9 @@ def _flash_attn_bwd(
         cu_seqlens_k_tensor,
         seqused_q_tensor,
         seqused_k_tensor,
+        mdQ_semaphore=mdQ_semaphore_cute,
+        mdK_semaphore=mdK_semaphore_cute,
+        mdV_semaphore=mdV_semaphore_cute,
     )
 
     num_threads = 256 if compute_capability == 9 else 128
