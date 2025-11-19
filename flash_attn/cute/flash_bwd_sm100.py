@@ -403,13 +403,13 @@ class FlashAttentionBackwardSm100:
         semaphore_transpose = [2, 3, 1, 0]  # (b, n, block, stage) -> (block, stage, n, b)
         if const_expr(self.deterministic):
             assert mdQ_semaphore is not None
-            mdQ_semaphore = utils.select(mdQ_semaphore.layout, mode=semaphore_transpose)
+            mdQ_semaphore = utils.select(mdQ_semaphore, mode=semaphore_transpose)
 
         if const_expr(self.deterministic and self.qhead_per_kvhead > 1):
             assert mdK_semaphore is not None
             assert mdV_semaphore is not None
             mdK_semaphore, mdV_semaphore = [
-                utils.select(t.layout, mode=semaphore_transpose)
+                utils.select(t, mode=semaphore_transpose)
                 for t in (mdK_semaphore, mdV_semaphore)
             ]
         else:
@@ -2276,6 +2276,8 @@ class FlashAttentionBackwardSm100:
 
         if const_expr(self.deterministic and self.qhead_per_kvhead > 1):
             mdKV_semaphore_cur = mdKV_semaphore[n_block, None, head_idx_kv, batch_idx]
+        else:
+            mdKV_semaphore_cur = None
 
         if const_expr(self.qhead_per_kvhead == 1):
             tdKVsdKV, tdKVgdKV = cpasync.tma_partition(
@@ -2301,7 +2303,7 @@ class FlashAttentionBackwardSm100:
         pipeline_dKV.consumer_wait(consumer_state_dKV)
 
         # semaphore acquire
-        if const_expr(self.deterministic):
+        if const_expr(self.deterministic and self.qhead_per_kvhead > 1):
             barrier.wait_eq(
                 mdKV_semaphore_cur.iterator, tidx, wg_idx, head_idx % self.qhead_per_kvhead
             )
@@ -2377,7 +2379,7 @@ class FlashAttentionBackwardSm100:
 
         # semaphore release
         # NOTE: arrive_inc calls red_release which issues membar
-        if const_expr(self.deterministic):
+        if const_expr(self.deterministic and self.qhead_per_kvhead > 1):
             if leader_warp:
                 cute.arch.cp_async_bulk_commit_group()
                 cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
