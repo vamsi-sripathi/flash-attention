@@ -538,6 +538,7 @@ def _flash_attn_bwd(
     softmax_scale: Optional[float] = None,
     causal: bool = False,
     softcap: float = 0.0,
+    deterministic: Optional[bool] = False,
     m_block_size: int = 64,
     n_block_size: int = 128,
     num_threads: int = 256,
@@ -754,55 +755,44 @@ def _flash_attn_bwd(
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
 
+    # allocate memory for semaphores if SM100 and deterministic mode is set
+    if compute_capability == 10 and deterministic:
+        # TODO: better way to set this across interface and SM100 bwd kernel?
+        tile_m = 128  # Default M tile size for SM100
+        tile_n = 128  # Default N tile size for SM100
+        num_m_blocks = (seqlen_q + tile_m - 1) // tile_m
+        num_n_blocks = (seqlen_k + tile_n - 1) // tile_n
 
-    tile_m = 128  # Default M tile size for SM100
-    tile_n = 128  # Default N tile size for SM100
-    num_m_blocks = (seqlen_q + tile_m - 1) // tile_m
-    num_n_blocks = (seqlen_k + tile_n - 1) // tile_n
-
-    # print(f"Creating semaphore tensors:")
-    # print(f"  mdQ_semaphore shape: ({batch_size}, {num_head}, {num_m_blocks}, 2)")
-    mdQ_semaphore = create_semaphore_tensor(
-        batch_size, num_head, num_m_blocks, num_stages=2, device=device
-    )
-
-    # For GQA with deterministic mode, we MUST provide mdK and mdV semaphores
-    # These are used for synchronization when accumulating gradients across query heads
-    qhead_per_kvhead = num_head // num_head_kv
-    if qhead_per_kvhead > 1:
-        # print(f"  mdK_semaphore shape: ({batch_size}, {num_head_kv}, {num_n_blocks}, 2)")
-        # print(f"  mdV_semaphore shape: ({batch_size}, {num_head_kv}, {num_n_blocks}, 2)")
-
-        # mdK_semaphore: (batch, num_heads_kv, num_n_blocks, num_stages)
-        mdK_semaphore = create_semaphore_tensor(
-            batch_size, num_head_kv, num_n_blocks, num_stages=2, device=device
+        mdQ_semaphore = create_semaphore_tensor(
+            batch_size, num_head, num_m_blocks, num_stages=2, device=device
         )
-        # mdV_semaphore: (batch, num_heads_kv, num_n_blocks, num_stages)
-        mdV_semaphore = create_semaphore_tensor(
-            batch_size, num_head_kv, num_n_blocks, num_stages=2, device=device
+
+        qhead_per_kvhead = num_head // num_head_kv
+        if qhead_per_kvhead > 1:
+            mdK_semaphore = create_semaphore_tensor(
+                batch_size, num_head_kv, num_n_blocks, num_stages=2, device=device
+            )
+            mdV_semaphore = create_semaphore_tensor(
+                batch_size, num_head_kv, num_n_blocks, num_stages=2, device=device
+            )
+        else:
+            mdK_semaphore = None
+            mdV_semaphore = None
+
+        mdQ_semaphore_cute = from_dlpack(mdQ_semaphore.detach(), assumed_align=8).mark_layout_dynamic(
+            leading_dim=mdQ_semaphore.ndim - 1
         )
-    else:
-        mdK_semaphore = None
-        mdV_semaphore = None
 
-
-
-    # print(f"\nConverting semaphore tensors to cute format...")
-    mdQ_semaphore_cute = from_dlpack(mdQ_semaphore.detach(), assumed_align=8).mark_layout_dynamic(
-        leading_dim=mdQ_semaphore.ndim - 1
-    )
-
-    if mdK_semaphore is not None and mdV_semaphore is not None:
-        mdK_semaphore_cute = from_dlpack(mdK_semaphore.detach(), assumed_align=8).mark_layout_dynamic(
-            leading_dim=mdK_semaphore.ndim - 1
-        )
-        mdV_semaphore_cute = from_dlpack(mdV_semaphore.detach(), assumed_align=8).mark_layout_dynamic(
-            leading_dim=mdV_semaphore.ndim - 1
-        )
-    else:
-        mdK_semaphore_cute = None
-        mdV_semaphore_cute = None
-
+        if mdK_semaphore is not None and mdV_semaphore is not None:
+            mdK_semaphore_cute = from_dlpack(mdK_semaphore.detach(), assumed_align=8).mark_layout_dynamic(
+                leading_dim=mdK_semaphore.ndim - 1
+            )
+            mdV_semaphore_cute = from_dlpack(mdV_semaphore.detach(), assumed_align=8).mark_layout_dynamic(
+                leading_dim=mdV_semaphore.ndim - 1
+            )
+        else:
+            mdK_semaphore_cute = None
+            mdV_semaphore_cute = None
 
     # Preprocess kernel: compute (o * dout).sum(dim=-1), lse * log2_e, and zero out dq_accum.
     compile_key_pre = (compute_capability, dtype, head_dim_v, m_block_size, num_threads)
@@ -921,16 +911,6 @@ def _flash_attn_bwd(
                 V_in_regs=V_in_regs,
             )
         else:
-#            fa_bwd_obj = FlashAttentionBackwardSm100(
-#                head_dim,
-#                head_dim_v,
-#                is_causal=causal,
-#                qhead_per_kvhead=qhead_per_kvhead,
-                # tile_m=m_block_size,
-                # tile_n=n_block_size,
-#                cluster_size=cluster_size,
-                # cluster_size=1,
-#            )
             fa_bwd_obj = FlashAttentionBackwardSm100(
                 head_dim=head_dim,
                 head_dim_v=head_dim_v,
@@ -940,11 +920,8 @@ def _flash_attn_bwd(
                 tile_m=tile_m,
                 tile_n=tile_n,
                 is_persistent=False,
-                deterministic=True,
-                # tile_m=m_block_size,
-                # tile_n=n_block_size,
+                deterministic=deterministic,
                 cluster_size=cluster_size,
-                # cluster_size=1,
             )
 
         # TODO: check @can_implement
@@ -1100,6 +1077,7 @@ class FlashAttnFunc(torch.autograd.Function):
         full_block_idx: Optional[torch.Tensor] = None,
         mask_block_cnt: Optional[torch.Tensor] = None,
         mask_block_idx: Optional[torch.Tensor] = None,
+        deterministic: Optional[bool] = False,
     ):
         # Only create block sparse tensors if at least one block sparse parameter is provided
         block_sparse_tensors = None
@@ -1130,6 +1108,7 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.causal = causal
         ctx.window_size = window_size
         ctx.softcap = softcap
+        ctx.deterministic = deterministic
         return out, lse
 
     @staticmethod
@@ -1145,6 +1124,7 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.softmax_scale,
             ctx.causal,
             ctx.softcap,
+            ctx.deterministic,
         )
         return dq, dk, dv, *((None,) * 20)  # Extra Nones is fine
 
@@ -1168,6 +1148,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         softcap: float = 0.0,
         num_splits: int = 1,
         pack_gqa: Optional[bool] = None,
+        deterministic: Optional[bool] = False,
     ):
         out, lse = _flash_attn_fwd(
             q,
@@ -1192,6 +1173,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.causal = causal
         ctx.window_size = window_size
         ctx.softcap = softcap
+        ctx.deterministic = deterministic
         return out, lse
 
     @staticmethod
@@ -1209,6 +1191,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.softmax_scale,
             ctx.causal,
             ctx.softcap,
+            deterministic=ctx.deterministic,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
             seqused_q=seqused_q,
@@ -1234,6 +1217,7 @@ def flash_attn_func(
     full_block_idx: Optional[torch.Tensor] = None,
     mask_block_cnt: Optional[torch.Tensor] = None,
     mask_block_idx: Optional[torch.Tensor] = None,
+    deterministic: Optional[bool] = False,
 ):
     return FlashAttnFunc.apply(
         q,
@@ -1251,6 +1235,7 @@ def flash_attn_func(
         full_block_idx,
         mask_block_cnt,
         mask_block_idx,
+        deterministic,
     )
 
 
@@ -1270,6 +1255,7 @@ def flash_attn_varlen_func(
     softcap: float = 0.0,
     num_splits: int = 1,
     pack_gqa: Optional[bool] = None,
+    deterministic: Optional[bool] = False,
 ):
     return FlashAttnVarlenFunc.apply(
         q,
@@ -1287,6 +1273,7 @@ def flash_attn_varlen_func(
         softcap,
         num_splits,
         pack_gqa,
+        deterministic,
     )
 
 
